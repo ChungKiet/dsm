@@ -10,6 +10,7 @@ members = [
     "tools/vector_runner",
     "tools/vector_builder",
     "tools/vertical_validation",
+    "dsm-exchange-node",
 ]
 # RP2350 firmware is a thumbv8m-only binary; built separately from inside the
 # crate dir (its .cargo/config.toml sets the target). Excluded so host

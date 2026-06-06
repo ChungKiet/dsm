@@ -175,6 +175,14 @@ pub fn record_pending_online_transition_with_conn(
                 && existing_next_tip == next_tip
     );
     if existing_gate.is_some() && !existing_gate_is_identical {
+        log::warn!("[online_outbox] existing gate msg_id={:?} parent={:?} next={:?}; new msg_id={} parent={:?} next={:?}",
+            existing_gate.as_ref().map(|(m,_,_)| &m[..m.len().min(8)]),
+            existing_gate.as_ref().map(|(_, p, _)| &p[..p.len().min(4)]),
+            existing_gate.as_ref().map(|(_, _, n)| &n[..n.len().min(4)]),
+            &message_id[..message_id.len().min(8)],
+            &parent_tip[..parent_tip.len().min(4)],
+            &next_tip[..next_tip.len().min(4)],
+        );
         return Err(anyhow!(
             "Pending online transition already exists with a different gate for this counterparty"
         ));

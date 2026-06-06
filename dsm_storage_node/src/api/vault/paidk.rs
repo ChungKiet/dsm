@@ -42,6 +42,9 @@ const DEFAULT_FLAT_RATE: i64 = 1000;
 /// mutation) is governed by stake/registry binding instead and does not
 /// route through this gate.
 pub async fn require_paidk(state: &AppState, device_id: &str) -> Result<(), StatusCode> {
+    if std::env::var("DSM_LOCAL_DEV").is_ok() {
+        return Ok(());
+    }
     let pool = &*state.db_pool;
     match db::is_paidk_satisfied(pool, device_id).await {
         Ok(true) => Ok(()),

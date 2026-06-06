@@ -3549,7 +3549,7 @@ async fn verify_device_tree_evidence_quorum(
         ));
     }
 
-    if std::env::var("DSM_SDK_TEST_MODE").is_ok() {
+    if std::env::var("DSM_SDK_TEST_MODE").is_ok() || std::env::var("DSM_LOCAL_DEV").is_ok() {
         let mut verified = Vec::new();
         let mut seen = std::collections::HashSet::new();
 

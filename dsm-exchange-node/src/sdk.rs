@@ -1,27 +1,49 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! SDK bootstrap: DBRW key management, genesis creation, and SDK init.
+//! SDK bootstrap: mnemonic-rooted (Genesis v2/v3) wallet identity, genesis creation, and SDK init.
+//!
+//! ## Migration note (2026-09)
+//!
+//! This module used to bootstrap identity from a random on-disk "C-DBRW" hardware-binding
+//! key (`load_or_create_dbrw_key`, `set_cdbrw_binding_key_for_testing`, `cdbrw_binding`).
+//! `dsm_sdk` has since dropped that model entirely in favour of the canonical **mnemonic-
+//! rooted Genesis v2/v3** identity: a device's whole identity (device_id, genesis hash, AK
+//! signing keypair, Kyber keypair) is a deterministic function of a BIP-39 wallet seed, the
+//! network id, and a fixed authority-policy hash — re-derivable at any time from the seed
+//! alone, with no separate binding-key file and no C-DBRW trust gate.
+//!
+//! The real onboarding path this mirrors is `handle_create_genesis_v2_query`
+//! (`dsm_sdk::handlers::system_routes`, `system.createGenesisV2`) together with the
+//! production restart path in `dsm_sdk::init::install_full_app_router_self_config` — see
+//! [`load_or_create_identity`] and [`install_full_router`] below for the exchange-node
+//! equivalents (adapted because both of those are `pub(crate)` inside `dsm_sdk` and this
+//! crate only gets the public surface).
 
 use std::path::Path;
 
 use anyhow::{anyhow, Context};
 use prost::Message;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use dsm_sdk::handlers::AppRouterImpl;
 use dsm_sdk::init::SdkConfig;
 use dsm_sdk::sdk::app_state::AppState;
+use dsm_sdk::sdk::core_sdk::CoreSDK;
+use dsm_sdk::sdk::kyber_identity::build_local_kyber_identity_binding;
+use dsm_sdk::sdk::recovery_sdk::RecoverySDK;
 use dsm_sdk::sdk::storage_node_sdk::{StorageNodeConfig, StorageNodeSDK};
-use dsm_sdk::security::cdbrw_access_gate::{
-    next_iter, store_trust, AccessLevel, ResonantStatus, TrustSnapshot,
-};
 use dsm_sdk::storage::{store_genesis_record_with_verification, GenesisRecord};
 use dsm_sdk::generated as pb;
 
 use crate::config::Config;
 
-/// Persisted exchange identity (written after first genesis).
+/// Persisted (well — re-derivable) exchange identity, reported via `GET /identity`.
+///
+/// This is NOT the source of truth across restarts: the source of truth is the wallet seed
+/// (sealed at rest by `dsm_sdk`, or re-derivable from the local mnemonic backup file — see
+/// [`ensure_wallet_seed_cached`]) plus `dsm_sdk`'s own `AppState` persistence
+/// (`dsm_app_state.pb`). Genesis v3 is a deterministic function of the wallet seed, so this
+/// struct is simply rebuilt fresh on every boot; it never needs its own on-disk file.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IdentityState {
     /// 32-byte device ID, hex-encoded.
@@ -49,11 +71,6 @@ pub async fn bootstrap(cfg: &Config) -> anyhow::Result<IdentityState> {
         info!("StorageNodeSDK env config: {env_path}");
     }
 
-    // Load or generate DBRW binding key
-    let dbrw_key = load_or_create_dbrw_key(&cfg.identity.dbrw_key_path)?;
-    dsm_sdk::set_cdbrw_binding_key_for_testing(dbrw_key.clone());
-    info!("DBRW binding key installed ({} bytes)", dbrw_key.len());
-
     // Initialise SDK routers (bilateral + unilateral + app router stubs)
     let sdk_cfg = SdkConfig {
         node_id: cfg.node.id.clone(),
@@ -64,8 +81,8 @@ pub async fn bootstrap(cfg: &Config) -> anyhow::Result<IdentityState> {
         .map_err(|e| anyhow!("init_dsm_sdk failed: {e}"))?;
     info!("dsm_sdk initialized (node_id={})", cfg.node.id);
 
-    // Load or create genesis identity
-    let identity = load_or_create_identity(cfg, &dbrw_key).await?;
+    // Load or create the mnemonic-rooted genesis identity.
+    let identity = load_or_create_identity(cfg).await?;
     info!(
         "Exchange identity ready: device_id={}…",
         &identity.device_id_hex[..12]
@@ -93,8 +110,21 @@ async fn register_on_all_endpoints(cfg: &Config, identity: &IdentityState) {
         Ok(b) => b,
         Err(_) => return,
     };
-    let public_key = dsm_sdk::sdk::app_state::AppState::get_public_key()
-        .unwrap_or_default();
+    let public_key = dsm_sdk::sdk::app_state::AppState::get_public_key().unwrap_or_default();
+
+    // MANDATORY on the current registration wire format: the ML-KEM-768 public key
+    // recipients encapsulate against for online per-step-EK sends, plus the device-AK
+    // signature binding it to (device_id, genesis_hash). Built the same way production
+    // does it (`b0x_sdk`, `storage_node_sdk`) — never hand-rolled here.
+    let (kyber_public_key, kyber_binding_sig) = match build_local_kyber_identity_binding() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                "kyber identity binding unavailable; skipping device registration: {e}"
+            );
+            return;
+        }
+    };
 
     let device_b32 = dsm_sdk::util::text_id::encode_base32_crockford(&device_id_bytes);
     let genesis_b32 = dsm_sdk::util::text_id::encode_base32_crockford(&genesis_bytes);
@@ -103,9 +133,13 @@ async fn register_on_all_endpoints(cfg: &Config, identity: &IdentityState) {
         device_id: device_id_bytes,
         pubkey: public_key,
         genesis_hash: genesis_bytes,
+        kyber_public_key,
+        kyber_binding_sig,
     };
     let mut body = Vec::new();
-    if req.encode(&mut body).is_err() { return; }
+    if req.encode(&mut body).is_err() {
+        return;
+    }
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -163,7 +197,8 @@ async fn try_register_or_reissue(
             {
                 Ok(r2) if r2.status().is_success() => {
                     let bytes = r2.bytes().await.ok()?;
-                    let resp = dsm_sdk::generated::RegisterDeviceResponse::decode(bytes.as_ref()).ok()?;
+                    let resp =
+                        dsm_sdk::generated::RegisterDeviceResponse::decode(bytes.as_ref()).ok()?;
                     Some(dsm_sdk::util::text_id::encode_base32_crockford(&resp.token))
                 }
                 _ => None,
@@ -173,399 +208,263 @@ async fn try_register_or_reissue(
     }
 }
 
-// ── DBRW key helpers ─────────────────────────────────────────────────────────
+// ── Wallet-seed helpers ──────────────────────────────────────────────────────
 
-fn load_or_create_dbrw_key(path: &str) -> anyhow::Result<Vec<u8>> {
+/// Ensure the BIP-39 wallet seed is cached in-process (unlocking, or creating, this
+/// exchange node's identity), and return it.
+///
+/// A server has no human present at boot to type a mnemonic, so unlike the mobile wallet
+/// this has to bootstrap unattended. Order of preference:
+///
+///  1. **Fast path**: [`RecoverySDK::load_and_cache_wallet_seed`] restores the seed from the
+///     sealed-at-rest blob `dsm_sdk` already keeps in its SQLite DB (sealed via
+///     `dsm_sdk::sdk::seed_vault` — a software XChaCha20-Poly1305 box on a non-Android host,
+///     the same mechanism a phone restart uses without re-prompting for the mnemonic).
+///  2. **Local mnemonic backup**: if that sealed blob is missing (e.g. `data_dir`'s SQLite
+///     file was wiped/rotated independently of the mnemonic backup), read the plaintext
+///     mnemonic this function persisted on first boot and re-derive+re-cache from it (which
+///     also reseals the blob for next time).
+///  3. **Genuinely first boot**: generate a fresh mnemonic, cache+seal it, and ALSO persist
+///     the plaintext mnemonic to `cfg.identity.mnemonic_path`. This is a deliberate departure
+///     from the phone model (which never persists the mnemonic, only the sealed seed) — a
+///     server has no separate secure paper-backup step, and losing both the sealed blob and
+///     the mnemonic would strand real customer funds. The mnemonic file is therefore this
+///     process's disaster-recovery backup; treat its directory with the same care as the old
+///     `dbrw.key` it replaces (owner-only permissions, not world-readable, not committed).
+fn ensure_wallet_seed_cached(cfg: &Config) -> anyhow::Result<Vec<u8>> {
+    if matches!(RecoverySDK::load_and_cache_wallet_seed(), Ok(true)) {
+        info!("Wallet seed restored from sealed at-rest cache");
+        return RecoverySDK::get_cached_wallet_seed()
+            .ok_or_else(|| anyhow!("wallet seed cache unexpectedly empty after sealed load"));
+    }
+
+    let path = &cfg.identity.mnemonic_path;
     if Path::new(path).exists() {
-        let hex_str = std::fs::read_to_string(path)
-            .with_context(|| format!("reading DBRW key from {path}"))?;
-        let key = hex::decode(hex_str.trim())
-            .with_context(|| format!("decoding DBRW key hex from {path}"))?;
-        if key.len() != 32 {
-            anyhow::bail!("DBRW key at {path} must be 32 bytes");
-        }
-        info!("DBRW binding key loaded from {path}");
-        Ok(key)
+        let mnemonic = std::fs::read_to_string(path)
+            .with_context(|| format!("reading mnemonic backup from {path}"))?;
+        RecoverySDK::derive_and_cache_key(mnemonic.trim())
+            .map_err(|e| anyhow!("derive_and_cache_key from persisted mnemonic failed: {e:?}"))?;
+        info!("Wallet seed re-derived from persisted mnemonic backup at {path}");
     } else {
-        let mut key = vec![0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
-        let hex_str = hex::encode(&key);
+        info!("No existing identity — generating a new mnemonic-rooted wallet identity");
+        let mnemonic = RecoverySDK::generate_mnemonic()
+            .map_err(|e| anyhow!("generate_mnemonic failed: {e:?}"))?;
         if let Some(parent) = Path::new(path).parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent dirs for {path}"))?;
         }
-        std::fs::write(path, &hex_str)
-            .with_context(|| format!("writing DBRW key to {path}"))?;
-        info!("New DBRW binding key generated and saved to {path}");
-        Ok(key)
+        std::fs::write(path, &mnemonic).with_context(|| format!("writing mnemonic to {path}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mut perm = meta.permissions();
+                perm.set_mode(0o600);
+                let _ = std::fs::set_permissions(path, perm);
+            }
+        }
+        RecoverySDK::derive_and_cache_key(&mnemonic)
+            .map_err(|e| anyhow!("derive_and_cache_key for new mnemonic failed: {e:?}"))?;
+        info!("New mnemonic generated and persisted to {path}");
     }
+
+    RecoverySDK::get_cached_wallet_seed()
+        .ok_or_else(|| anyhow!("wallet seed cache unexpectedly empty after derive_and_cache_key"))
 }
 
 // ── Identity helpers ─────────────────────────────────────────────────────────
 
-async fn load_or_create_identity(
-    cfg: &Config,
-    dbrw_key: &[u8],
-) -> anyhow::Result<IdentityState> {
-    let path = &cfg.identity.identity_state_path;
-    if Path::new(path).exists() {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading identity state from {path}"))?;
-        let state: IdentityState = serde_json::from_str(&text)
-            .with_context(|| format!("parsing identity state from {path}"))?;
+/// Bring up (or re-derive) this exchange node's identity and install it everywhere `dsm_sdk`
+/// expects it to live: `AppState`, the SDK context, the durable device-head cache, and the
+/// full `AppRouterImpl`.
+///
+/// Genesis v3 is a pure function of `(wallet_seed, network_id, wallet_index, device_slot,
+/// genesis_version, authority_policy_hash)`, so re-running it on every boot with the SAME
+/// wallet seed reproduces the identical `(device_id, genesis_hash, AK keypair)` every time —
+/// there is no "first boot vs restart" branch to get wrong here, and every downstream install
+/// step below (`install_v2_genesis`, `store_genesis_record_with_verification`,
+/// `AppState::set_identity_info`) is documented idempotent / safe to repeat.
+async fn load_or_create_identity(cfg: &Config) -> anyhow::Result<IdentityState> {
+    let wallet_seed = ensure_wallet_seed_cached(cfg)?;
 
-        let device_id = hex::decode(&state.device_id_hex)?;
-        let genesis_hash = hex::decode(&state.genesis_hash_hex)?;
-        let entropy = derive_entropy(&device_id, &genesis_hash, dbrw_key);
-        dsm_sdk::initialize_sdk_context(device_id.clone(), genesis_hash.clone(), entropy)
-            .map_err(|e| anyhow!("initialize_sdk_context failed: {e:?}"))?;
+    let aph = dsm_sdk::dsm::core::identity::genesis_session::genesis_authority_policy_hash();
+    let outcome = dsm_sdk::dsm::core::identity::genesis::create_genesis_v3_self_attested(
+        &wallet_seed,
+        cfg.node.network.as_bytes(),
+        0, // wallet_index
+        0, // device_slot (primary device)
+        3, // genesis_version
+        &aph,
+    )
+    .map_err(|e| anyhow!("genesis v3 derivation failed: {e:?}"))?;
 
-        // Re-populate AppState from persisted identity on restart.
-        // Must derive with K_DBRW (same as genesis path) not raw dbrw_key.
-        let k_dbrw_load = {
-            let mut hw = [0u8; 32];
-            let mut env = [0u8; 32];
-            blake3::Hasher::new_derive_key("DSM/exchange-node/hw-entropy")
-                .update(dbrw_key).update(cfg.node.id.as_bytes())
-                .finalize_xof().fill(&mut hw);
-            blake3::Hasher::new_derive_key("DSM/exchange-node/env-fingerprint")
-                .update(dbrw_key).update(cfg.node.network.as_bytes())
-                .finalize_xof().fill(&mut env);
-            dsm_sdk::dsm::crypto::cdbrw_binding::derive_cdbrw_binding_key(
-                &genesis_hash, &genesis_hash, &hw, &env,
-            ).map(|k| k.to_vec())
-            .unwrap_or_else(|_| dbrw_key.to_vec())
-        };
-        // Install K_DBRW as the binding key so signing_authority uses the same key.
-        // Without this, b0x_sdk signs registration requests with raw dbrw_key while
-        // AppState reports K_DBRW-derived key → storage node rejects token re-issue.
-        if let Ok(k_arr) = k_dbrw_load.as_slice().try_into().map(|b: [u8; 32]| b) {
-            dsm_sdk::set_cdbrw_binding_key_for_testing(k_arr.to_vec());
+    let devid = outcome
+        .state
+        .device_id
+        .ok_or_else(|| anyhow!("v3 genesis missing device_id"))?;
+    let g = outcome.state.hash;
+    let ak_pk = outcome.state.signing_key.public_key.clone();
+    let smt_root = outcome.state.merkle_root.unwrap_or(g);
+
+    // Install the genesis as the canonical device-head root. `install_v2_genesis` /
+    // `write_genesis_device_head` PRESERVE an already-advanced head if one exists in the
+    // durable `bcr_device_heads` cache (they only fill in the genesis digest/legacy-root
+    // when missing) — so on a restart this call is a safe no-op re-assertion, never a
+    // rollback of real balances/history. On a genuinely first boot it seeds a fresh
+    // zero-value head.
+    let device_info = dsm_sdk::dsm::types::state_types::DeviceInfo::new(devid, ak_pk.clone());
+    let core = CoreSDK::new_with_device(device_info)
+        .map_err(|e| anyhow!("CoreSDK::new_with_device failed: {e:?}"))?;
+    core.install_v2_genesis(&outcome.state)
+        .map_err(|e| anyhow!("install_v2_genesis failed: {e:?}"))?;
+
+    // Persist the public GenesisRecord (INSERT OR REPLACE — safe every boot) and ensure a
+    // wallet_state row exists so wallet.sendSmart can resolve local_genesis_hash().
+    let device_id_b32 = dsm_sdk::util::text_id::encode_base32_crockford(&devid);
+    let genesis_id_b32 = dsm_sdk::util::text_id::encode_base32_crockford(&g);
+    let nonce_b32 = dsm_sdk::util::text_id::encode_base32_crockford(&outcome.genesis_nonce);
+    let record = GenesisRecord {
+        genesis_id: genesis_id_b32.clone(),
+        device_id: device_id_b32.clone(),
+        mpc_proof: String::new(),
+        // Legacy C-DBRW binding-record column; Genesis v2/v3 has no silicon binding.
+        device_birth_binding: String::new(),
+        merkle_root: dsm_sdk::util::text_id::encode_base32_crockford(&smt_root),
+        participant_count: 0,
+        progress_marker: "genesis".to_string(),
+        publication_hash: genesis_id_b32,
+        storage_nodes: cfg.storage.endpoints.clone(),
+        entropy_hash: nonce_b32.clone(),
+        protocol_version: "genesis-v3".to_string(),
+        hash_chain_proof: None,
+        smt_proof: None,
+        verification_step: None,
+        genesis_nonce: nonce_b32,
+        genesis_profile: "MnemonicV3".to_string(),
+        network_id: cfg.node.network.clone(),
+    };
+    store_genesis_record_with_verification(&record)
+        .map_err(|e| anyhow!("store_genesis_record_with_verification failed: {e}"))?;
+    dsm_sdk::storage::client_db::ensure_wallet_state_for_device(&device_id_b32)
+        .map_err(|e| anyhow!("ensure_wallet_state_for_device failed: {e}"))?;
+
+    // Install identity into AppState — persisted to dsm_app_state.pb, so a restart's
+    // `AppState::get_has_identity()`/`get_device_id()`/etc. read it back automatically.
+    AppState::set_identity_info(devid.to_vec(), ak_pk.clone(), g.to_vec(), smt_root.to_vec());
+    AppState::set_has_identity(true);
+
+    // SDK-context entropy, rooted in the wallet seed. Mirrors dsm_sdk's own
+    // `derive_production_entropy` (domain "DSM/sdk-hash" over device_id||genesis||seed),
+    // which is `pub(crate)` and not reachable from this crate.
+    let entropy = derive_entropy(&devid, &g, &wallet_seed);
+    dsm_sdk::initialize_sdk_context(devid.to_vec(), g.to_vec(), entropy)
+        .map_err(|e| anyhow!("initialize_sdk_context failed: {e:?}"))?;
+
+    // Upgrade MinimalBootstrapRouter → full AppRouterImpl.
+    install_full_router(cfg).await?;
+
+    // Best-effort registry publish so a peer's contacts.addManual can verify this genesis.
+    // Non-fatal: local genesis is already durable regardless of network reachability.
+    publish_genesis_to_registry(cfg, &devid, &g, &ak_pk, &smt_root, &outcome.genesis_nonce).await;
+
+    let kyber_public_key_hex = match build_local_kyber_identity_binding() {
+        Ok((pk, _sig)) => hex::encode(pk),
+        Err(e) => {
+            tracing::warn!("kyber identity binding unavailable at genesis time: {e}");
+            String::new()
         }
+    };
 
-        let public_key = derive_signing_public_key(&genesis_hash, &device_id, &k_dbrw_load)
-            .unwrap_or_else(|e| {
-                tracing::warn!("signing key derivation failed: {e}; using AppState key");
-                AppState::get_public_key().unwrap_or_default()
-            });
-        let smt_root = dsm_sdk::dsm::merkle::sparse_merkle_tree::empty_root(
-            dsm_sdk::dsm::merkle::sparse_merkle_tree::DEFAULT_SMT_HEIGHT,
-        )
-        .to_vec();
-        AppState::set_identity_info(device_id.clone(), public_key, genesis_hash.clone(), smt_root);
-        AppState::set_has_identity(true);
-
-        // Ensure genesis record is in SQLite (idempotent — safe to call on every restart).
-        ensure_genesis_record_in_db(&state, &genesis_hash, &device_id, dbrw_key, cfg);
-
-        // Upgrade bootstrap router to full AppRouterImpl
-        install_full_router(cfg)?;
-
-        // Backfill kyber_public_key_hex if missing from persisted state (older nodes).
-        let state = if state.kyber_public_key_hex.is_empty() {
-            IdentityState {
-                kyber_public_key_hex: derive_kyber_public_key(&genesis_hash, &device_id, dbrw_key)
-                    .map(|k| hex::encode(&k))
-                    .unwrap_or_default(),
-                ..state
-            }
-        } else {
-            state
-        };
-
-        info!("Identity state loaded from {path}");
-        return Ok(state);
-    }
-
-    let state = create_genesis(cfg, dbrw_key).await?;
-    persist_identity(&state, path)?;
-    Ok(state)
+    info!("Genesis ready: device_id={}…", &device_id_b32[..12.min(device_id_b32.len())]);
+    Ok(IdentityState {
+        device_id_hex: hex::encode(devid),
+        genesis_hash_hex: hex::encode(g),
+        kyber_public_key_hex,
+    })
 }
 
-async fn create_genesis(cfg: &Config, dbrw_key: &[u8]) -> anyhow::Result<IdentityState> {
-    info!("No identity found — creating genesis via MPC (this may take ~10 s)");
-
-    // Build 32-byte client entropy deterministically from DBRW key + node id
-    let mut entropy = [0u8; 32];
-    let mut hasher = blake3::Hasher::new_derive_key("DSM/exchange-node/genesis-entropy");
-    hasher.update(dbrw_key);
-    hasher.update(cfg.node.id.as_bytes());
-    entropy.copy_from_slice(hasher.finalize().as_bytes());
-
-    // The updated SDK requires platform silicon inputs (hw_entropy + env_fingerprint)
-    // before genesis. On a server there is no hardware security module, so we derive
-    // deterministic values from the DBRW key. These serve the same role: binding the
-    // genesis to this specific server instance's key material.
-    let mut hw = [0u8; 32];
-    let mut env = [0u8; 32];
-    blake3::Hasher::new_derive_key("DSM/exchange-node/hw-entropy")
-        .update(dbrw_key).update(cfg.node.id.as_bytes())
-        .finalize_xof().fill(&mut hw);
-    blake3::Hasher::new_derive_key("DSM/exchange-node/env-fingerprint")
-        .update(dbrw_key).update(cfg.node.network.as_bytes())
-        .finalize_xof().fill(&mut env);
-    dsm_sdk::sdk::app_state::AppState::set_platform_entropy_inputs(hw.to_vec(), env.to_vec())
-        .map_err(|e| anyhow!("set_platform_entropy_inputs: {e}"))?;
-
-    // Build StorageNodeConfig directly from our configured endpoints
-    // (bypasses from_env_config which requires a dsm_env_config.toml file)
-    let mut node_cfg = StorageNodeConfig::new(cfg.storage.endpoints.clone());
-    // The beta nodes expose /api/v2/genesis/entropy so MPC genesis works directly;
-    // no dedicated MPC relay URL needed.
-    node_cfg.mpc_genesis_url = None;
-
-    let sdk = StorageNodeSDK::new(node_cfg)
-        .await
-        .map_err(|e| anyhow!("StorageNodeSDK::new failed: {e:?}"))?;
-
-    let res = sdk
-        .create_genesis_with_mpc(Some(entropy.to_vec()))
-        .await
-        .map_err(|e| anyhow!("create_genesis_with_mpc failed: {e:?}"))?;
-
-    if !res.complete {
-        anyhow::bail!("genesis did not complete (state={})", res.state);
-    }
-
-    let genesis_hash_bytes = res
-        .genesis_hash
-        .ok_or_else(|| anyhow!("genesis_hash missing from MPC response"))?;
-
-    if genesis_hash_bytes.len() != 32 {
-        anyhow::bail!("genesis returned non-32-byte hash");
-    }
-
-    // For the root device, device_id == genesis_hash
-    let device_id_bytes = genesis_hash_bytes.clone();
-
-    let kyber_pk_hex = derive_kyber_public_key(&genesis_hash_bytes, &device_id_bytes, dbrw_key)
-        .map(|k| hex::encode(&k))
-        .unwrap_or_default();
-
-    let state = IdentityState {
-        device_id_hex: hex::encode(&device_id_bytes),
-        genesis_hash_hex: hex::encode(&genesis_hash_bytes),
-        kyber_public_key_hex: kyber_pk_hex,
+/// Replace MinimalBootstrapRouter with the full [`AppRouterImpl`].
+/// Must be called AFTER AppState has device_id + genesis_hash set.
+async fn install_full_router(cfg: &Config) -> anyhow::Result<()> {
+    let sdk_cfg = SdkConfig {
+        node_id: cfg.node.id.clone(),
+        storage_endpoints: cfg.storage.endpoints.clone(),
+        enable_offline: false,
     };
-
-    let derived_entropy = derive_entropy(&device_id_bytes, &genesis_hash_bytes, dbrw_key);
-    dsm_sdk::initialize_sdk_context(
-        device_id_bytes.clone(),
-        genesis_hash_bytes.clone(),
-        derived_entropy,
-    )
-    .map_err(|e| anyhow!("initialize_sdk_context after genesis: {e:?}"))?;
-
-    // After create_genesis_with_mpc the SDK installs K_DBRW (not the raw dbrw_key).
-    // K_DBRW = derive_cdbrw_binding_key(genesis_hash, genesis_hash, hw, env).
-    // The signing key must be derived from K_DBRW, not dbrw_key directly.
-    let k_dbrw = {
-        let mut hw = [0u8; 32];
-        let mut env = [0u8; 32];
-        blake3::Hasher::new_derive_key("DSM/exchange-node/hw-entropy")
-            .update(dbrw_key).update(cfg.node.id.as_bytes())
-            .finalize_xof().fill(&mut hw);
-        blake3::Hasher::new_derive_key("DSM/exchange-node/env-fingerprint")
-            .update(dbrw_key).update(cfg.node.network.as_bytes())
-            .finalize_xof().fill(&mut env);
-        dsm_sdk::dsm::crypto::cdbrw_binding::derive_cdbrw_binding_key(
-            &genesis_hash_bytes, &genesis_hash_bytes, &hw, &env,
-        ).map(|k| k.to_vec())
-        .unwrap_or_else(|_| dbrw_key.to_vec())
-    };
-    let public_key = derive_signing_public_key(&genesis_hash_bytes, &device_id_bytes, &k_dbrw)
-        .unwrap_or_else(|e| {
-            tracing::warn!("signing key derivation failed post-genesis: {e}; using AppState key");
-            AppState::get_public_key().unwrap_or_default()
-        });
-
-    // Publish genesis to storage nodes so contacts.addManual can verify it
-    let empty_root = dsm_sdk::dsm::merkle::sparse_merkle_tree::empty_root(
-        dsm_sdk::dsm::merkle::sparse_merkle_tree::DEFAULT_SMT_HEIGHT,
+    let router = std::sync::Arc::new(
+        AppRouterImpl::new(sdk_cfg).map_err(|e| anyhow!("AppRouterImpl::new failed: {e:?}"))?,
     );
-    // Use dsm_sdk::generated types (SDK's own prost-generated code) — different
-    // from dsm_sdk::types::proto which re-exports the dsm crate's proto types.
-    let genesis_created = dsm_sdk::generated::GenesisCreated {
-        device_id: device_id_bytes.clone(),
-        genesis_hash: Some(dsm_sdk::generated::Hash32 {
-            v: genesis_hash_bytes.clone(),
+    let router_for_setup = router.clone();
+    dsm_sdk::bridge::install_app_router(router)
+        .map_err(|e| anyhow!("install_app_router failed: {e:?}"))?;
+    info!("Full AppRouterImpl installed");
+
+    // Mirrors `dsm_sdk::init`'s warm-swap rehydrate (`spawn_token_registry_rehydrate`):
+    // without this a token policy created in a previous process (or before this restart)
+    // cannot be resolved in-memory, and a device could not send/receive an asset it holds.
+    // We await it synchronously here (rather than spawning) because dsm-exchange-node wants
+    // full readiness BEFORE serving HTTP traffic — unlike the mobile app, nothing here needs
+    // wallet-creation UI to stay unblocked while it runs.
+    router_for_setup.install_policy_resolver();
+    router_for_setup.rehydrate_token_registry().await;
+    router_for_setup.republish_owned_policies().await;
+    info!("Policy resolver installed; token registry rehydrated");
+    Ok(())
+}
+
+/// Publish this device's genesis to the storage fleet's registry so a peer's
+/// `contacts.addManual` can verify it. Best-effort / non-fatal: a device's local genesis is
+/// durable independent of whether the network happens to be reachable right now.
+async fn publish_genesis_to_registry(
+    cfg: &Config,
+    device_id: &[u8; 32],
+    genesis_hash: &[u8; 32],
+    public_key: &[u8],
+    smt_root: &[u8; 32],
+    genesis_nonce: &[u8; 32],
+) {
+    let genesis_created = pb::GenesisCreated {
+        device_id: device_id.to_vec(),
+        genesis_hash: Some(pb::Hash32 {
+            v: genesis_hash.to_vec(),
         }),
-        public_key: public_key.clone(),
-        smt_root: Some(dsm_sdk::generated::Hash32 {
-            v: empty_root.to_vec(),
+        public_key: public_key.to_vec(),
+        smt_root: Some(pb::Hash32 {
+            v: smt_root.to_vec(),
         }),
-        device_entropy: entropy.to_vec(),
-        session_id: res.session_id,
-        threshold: 3,
+        device_entropy: genesis_nonce.to_vec(),
+        session_id: String::new(),
+        threshold: 0,
         storage_nodes: cfg.storage.endpoints.clone(),
         network_id: cfg.node.network.clone(),
         locale: "en".to_string(),
     };
-    // Re-use the StorageNodeSDK instance for publishing
     let mut publish_cfg = StorageNodeConfig::new(cfg.storage.endpoints.clone());
     publish_cfg.mpc_genesis_url = None;
-    if let Ok(publish_sdk) = StorageNodeSDK::new(publish_cfg).await {
-        match publish_sdk.publish_genesis_to_nodes(genesis_created).await {
+    match StorageNodeSDK::new(publish_cfg).await {
+        Ok(sdk) => match sdk.publish_genesis_to_nodes(genesis_created).await {
             Ok(r) => info!(
                 "Genesis published to {}/{} nodes",
                 r.published_to_nodes,
                 cfg.storage.endpoints.len()
             ),
             Err(e) => tracing::warn!("Genesis publish failed (non-fatal): {e:?}"),
-        }
+        },
+        Err(e) => tracing::warn!("StorageNodeSDK::new failed for genesis publish (non-fatal): {e:?}"),
     }
-    let smt_root = dsm_sdk::dsm::merkle::sparse_merkle_tree::empty_root(
-        dsm_sdk::dsm::merkle::sparse_merkle_tree::DEFAULT_SMT_HEIGHT,
-    )
-    .to_vec();
-    AppState::set_identity_info(
-        device_id_bytes.clone(),
-        public_key,
-        genesis_hash_bytes.clone(),
-        smt_root,
-    );
-    AppState::set_has_identity(true);
-
-    // Store genesis record in SQLite so wallet.sendSmart can resolve local_genesis_hash().
-    ensure_genesis_record_in_db(&state, &genesis_hash_bytes, &device_id_bytes, dbrw_key, cfg);
-
-    // Upgrade MinimalBootstrapRouter → full AppRouterImpl
-    install_full_router(cfg)?;
-
-    info!("Genesis complete: device_id={}…", &state.device_id_hex[..12]);
-    Ok(state)
-}
-
-/// Replace MinimalBootstrapRouter with the full AppRouterImpl.
-/// Must be called AFTER AppState has device_id + genesis_hash set.
-fn install_full_router(cfg: &Config) -> anyhow::Result<()> {
-    let sdk_cfg = SdkConfig {
-        node_id: cfg.node.id.clone(),
-        storage_endpoints: cfg.storage.endpoints.clone(),
-        enable_offline: false,
-    };
-    let router = AppRouterImpl::new(sdk_cfg)
-        .map_err(|e| anyhow!("AppRouterImpl::new failed: {e:?}"))?;
-    dsm_sdk::bridge::install_app_router(std::sync::Arc::new(router))
-        .map_err(|e| anyhow!("install_app_router failed: {e:?}"))?;
-    info!("Full AppRouterImpl installed");
-
-    // Bootstrap C-DBRW trust for server process (no mobile hardware orbit).
-    // On a server the binding key IS the "device" — publish FullAccess directly.
-    store_trust(TrustSnapshot {
-        access_level: AccessLevel::FullAccess,
-        resonant_status: ResonantStatus::Pass,
-        h_hat: 1.0,
-        rho_hat: 0.0,
-        l_hat: 1.0,
-        h0_eff: 1.0,
-        trust_score: 1.0,
-        recommended_n: 1,
-        w1_distance: 0.0,
-        w1_threshold: 1.0,
-        iter: next_iter(),
-    });
-    info!("C-DBRW trust bootstrapped (server mode, FullAccess)");
-    Ok(())
-}
-
-/// Ensure the genesis_records SQLite row exists for wallet.sendSmart.
-/// Uses INSERT OR REPLACE so safe to call on every boot.
-fn ensure_genesis_record_in_db(
-    state: &IdentityState,
-    genesis_hash: &[u8],
-    device_id: &[u8],
-    dbrw_key: &[u8],
-    cfg: &Config,
-) {
-    let genesis_id_b32 = dsm_sdk::util::text_id::encode_base32_crockford(genesis_hash);
-    let device_id_b32 = dsm_sdk::util::text_id::encode_base32_crockford(device_id);
-    let empty_smt_root = dsm_sdk::dsm::merkle::sparse_merkle_tree::empty_root(
-        dsm_sdk::dsm::merkle::sparse_merkle_tree::DEFAULT_SMT_HEIGHT,
-    );
-    let mut entropy_hasher = blake3::Hasher::new_derive_key("DSM/sdk-hash");
-    entropy_hasher.update(device_id);
-    entropy_hasher.update(genesis_hash);
-    entropy_hasher.update(dbrw_key);
-    let entropy_hash = hex::encode(entropy_hasher.finalize().as_bytes());
-
-    let record = GenesisRecord {
-        genesis_id: genesis_id_b32,
-        device_id: device_id_b32,
-        mpc_proof: state.genesis_hash_hex.clone(),
-        dbrw_binding: hex::encode(dbrw_key),
-        merkle_root: hex::encode(&empty_smt_root[..]),
-        participant_count: 3,
-        progress_marker: "genesis".to_string(),
-        publication_hash: String::new(),
-        storage_nodes: cfg.storage.endpoints.clone(),
-        entropy_hash,
-        protocol_version: "1".to_string(),
-        hash_chain_proof: None,
-        smt_proof: None,
-        verification_step: None,
-    };
-    match store_genesis_record_with_verification(&record) {
-        Ok(_) => info!(
-            "Genesis record ensured in SQLite ({}…)",
-            &state.genesis_hash_hex[..12]
-        ),
-        Err(e) => tracing::warn!("ensure_genesis_record_in_db failed (non-fatal): {e:?}"),
-    }
-}
-
-fn persist_identity(state: &IdentityState, path: &str) -> anyhow::Result<()> {
-    if let Some(parent) = Path::new(path).parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent dirs for {path}"))?;
-    }
-    let text = serde_json::to_string_pretty(state)?;
-    std::fs::write(path, text).with_context(|| format!("writing identity state to {path}"))?;
-    info!("Identity state persisted to {path}");
-    Ok(())
 }
 
 // ── Utility ──────────────────────────────────────────────────────────────────
 
-/// Derive SPHINCS+ signing public key from genesis_hash || device_id || dbrw_key.
-/// Mirrors the derivation in dsm_sdk::init (Android init path).
-fn derive_signing_public_key(
-    genesis_hash: &[u8],
-    device_id: &[u8],
-    dbrw_key: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    use dsm_sdk::crypto::signatures::SignatureKeyPair;
-    let mut key_entropy = Vec::with_capacity(96);
-    key_entropy.extend_from_slice(genesis_hash);
-    key_entropy.extend_from_slice(device_id);
-    key_entropy.extend_from_slice(dbrw_key);
-    let keypair = SignatureKeyPair::generate_from_entropy(&key_entropy)
-        .map_err(|e| anyhow!("generate_from_entropy: {e:?}"))?;
-    Ok(keypair.public_key().to_vec())
-}
-
-/// Derive a stable Kyber public key from genesis_hash || device_id || dbrw_key.
-/// Deterministic so the keypair is stable across restarts.
-pub fn derive_kyber_public_key(
-    genesis_hash: &[u8],
-    device_id: &[u8],
-    dbrw_key: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    use dsm_sdk::dsm::crypto::kyber::generate_kyber_keypair_from_entropy;
-    let mut entropy = Vec::with_capacity(96);
-    entropy.extend_from_slice(genesis_hash);
-    entropy.extend_from_slice(device_id);
-    entropy.extend_from_slice(dbrw_key);
-    let (pk, _sk) = generate_kyber_keypair_from_entropy(&entropy, "DSM/exchange-node/kyber-key")
-        .map_err(|e| anyhow!("generate_kyber_keypair_from_entropy: {e:?}"))?;
-    Ok(pk)
-}
-
-fn derive_entropy(device_id: &[u8], genesis_hash: &[u8], dbrw_key: &[u8]) -> Vec<u8> {
-    let mut h = blake3::Hasher::new_derive_key("DSM/sdk-hash");
+/// Domain-separated BLAKE3 over `device_id || genesis_hash || wallet_seed` — mirrors
+/// `dsm_sdk`'s internal `derive_production_entropy` (`pub(crate)`, domain "DSM/sdk-hash").
+fn derive_entropy(device_id: &[u8], genesis_hash: &[u8], wallet_seed: &[u8]) -> Vec<u8> {
+    let mut h = dsm_sdk::dsm::crypto::blake3::dsm_domain_hasher(
+        dsm_sdk::dsm::common::domain_tags::TAG_DSM_SDK_HASH,
+    );
     h.update(device_id);
     h.update(genesis_hash);
-    h.update(dbrw_key);
+    h.update(wallet_seed);
     h.finalize().as_bytes().to_vec()
 }
 

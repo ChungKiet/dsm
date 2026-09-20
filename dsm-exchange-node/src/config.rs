@@ -34,10 +34,16 @@ pub struct IdentityConfig {
     /// Base directory for all SDK-persisted data (SQLite DBs, state files).
     /// Must be set before any other SDK call.
     pub data_dir: String,
-    /// Path to persist the 32-byte DBRW binding key (hex-encoded on disk).
-    pub dbrw_key_path: String,
-    /// Path to persist genesis identity (device_id + genesis_hash, JSON).
-    pub identity_state_path: String,
+    /// Path to persist the BIP-39 mnemonic backup (plaintext on disk; disaster-recovery
+    /// fallback for the sealed-at-rest wallet seed dsm_sdk already keeps in SQLite). Written
+    /// once on first boot. Replaces the old `dbrw_key_path` (C-DBRW binding key), which no
+    /// longer exists in the mnemonic-rooted Genesis v2/v3 identity model.
+    pub mnemonic_path: String,
+    /// Unused since the mnemonic-rooted rewrite (identity is re-derived from the wallet
+    /// seed + dsm_sdk's own `AppState` persistence, not a separate JSON file). Kept so
+    /// existing config files don't need to drop the key; ignored if present.
+    #[serde(default)]
+    pub identity_state_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -69,11 +75,8 @@ impl Config {
         if self.identity.data_dir.is_empty() {
             anyhow::bail!("identity.data_dir must not be empty");
         }
-        if self.identity.dbrw_key_path.is_empty() {
-            anyhow::bail!("identity.dbrw_key_path must not be empty");
-        }
-        if self.identity.identity_state_path.is_empty() {
-            anyhow::bail!("identity.identity_state_path must not be empty");
+        if self.identity.mnemonic_path.is_empty() {
+            anyhow::bail!("identity.mnemonic_path must not be empty");
         }
         Ok(())
     }

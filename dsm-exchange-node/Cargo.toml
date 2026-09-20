@@ -1,0 +1,58 @@
+[package]
+name = "dsm-exchange-node"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Exchange sidecar wrapping dsm_sdk — exposes a JSON HTTP API for Go adapters"
+
+[[bin]]
+name = "dsm-exchange-node"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.51.0", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tower = { version = "0.5" }
+
+# Serialization (JSON for Go adapter HTTP API; protobuf handled by dsm_sdk internally)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# DSM SDK
+dsm_sdk = { version = "0.1.0-beta.3", path = "../dsm_client/deterministic_state_machine/dsm_sdk" }
+
+# Protobuf (for building ArgPack / decoding SDK responses)
+prost = "0.14"
+
+# Randomness (DBRW binding key generation)
+rand = "0.8"
+
+# Hex (for displaying hashes in logs)
+hex = "0.4"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client (for forwarding inbox acks to storage nodes)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# BLAKE3 (DBRW key derivation)
+blake3 = "1.4"
+
+[dev-dependencies]
+tokio = { version = "1.51.0", features = ["full", "test-util"] }

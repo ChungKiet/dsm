@@ -1,0 +1,30 @@
+# DSM Exchange Node — example configuration
+# Copy to config.toml and fill in your values.
+
+[node]
+id      = "exchange-node-1"
+network = "test"   # "test" for beta nodes, "main" for production
+
+[storage]
+# List at least 3 DSM storage node base URLs (K=3 replication).
+# These are the 6 beta GCP nodes shipped with the SDK:
+endpoints = [
+    "https://34.73.141.32:8080",
+    "https://35.243.157.151:8080",
+    "https://35.205.9.157:8080",
+    "https://34.53.251.120:8080",
+    "https://34.21.157.56:8080",
+    "https://34.87.93.29:8080",
+]
+# Optional: path to a dsm_env_config.toml for StorageNodeSDK MPC genesis.
+# If omitted the SDK uses its built-in node list.
+env_config_path = "data/dsm_env_config.toml"
+
+[identity]
+data_dir             = "data"
+dbrw_key_path        = "data/dbrw.key"
+identity_state_path  = "data/identity.json"
+
+[http]
+# Address the sidecar listens on.  The Go adapter connects here.
+listen = "127.0.0.1:9090"
